@@ -136,6 +136,17 @@ string getNavigationUrl() {
         settings::getOptionForCurrentMode("url").get<string>() : "https://neutralino.js.org";
 }
 
+// GHSA-4crw-f874-crr2 / CWE-79: Safely serialize JSON values into JavaScript source code.
+// Escapes HTML/script tags and line separators so the literal is safe in all JS/HTML contexts.
+string __escapeJsonForJs(const json &val) {
+    string dumped = val.dump();
+    // Escape "</script" to prevent breaking out of HTML <script> tags
+    dumped = regex_replace(dumped, regex("</script", regex_constants::icase), "<\\/script");
+    // Escape "<!--" to avoid HTML comment parsing anomalies
+    dumped = regex_replace(dumped, regex("<!--"), "<\\!--");
+    return dumped;
+}
+
 string getGlobalVars(){
     string jsSnippet = "var NL_OS='" + string(NEU_OS_NAME) + "';";
     jsSnippet += "var NL_ARCH='" + computer::getArch() + "';";
@@ -164,7 +175,14 @@ string getGlobalVars(){
     json jGlobalVariables = settings::getOptionForCurrentMode("globalVariables");
     if(!jGlobalVariables.is_null()) {
         for(const auto &it: jGlobalVariables.items()) {
-            jsSnippet += "var NL_" + it.key() +  "=JSON.parse('" + helpers::jsonToString(it.value()) + "');";
+            string key = it.key();
+            // GHSA-4crw-f874-crr2: Only allow valid alphanumeric/underscore identifier keys
+            if(!regex_match(key, regex("^[a-zA-Z0-9_]+$"))) {
+                debug::log(debug::LogTypeWarning, "SECURITY WARNING: Skipping invalid globalVariables key '" + key +
+                    "'. Keys must contain only alphanumeric characters and underscores.");
+                continue;
+            }
+            jsSnippet += "var NL_" + key + "=" + __escapeJsonForJs(it.value()) + ";";
         }
     }
     return jsSnippet;
