@@ -58,6 +58,10 @@ bool __isPathInScope(const string &originalPath, const string &scope) {
 }
 
 void __registerBlockList() {
+    blockedModules.clear();
+    blockedMethods.clear();
+    shouldCheckBlockList = false;
+
     json jNativeBlockList = settings::getOptionForCurrentMode("nativeBlockList");
     if(jNativeBlockList.is_null())
         return;
@@ -73,10 +77,19 @@ void __registerBlockList() {
             blockedMethods.push_back(blockListVector[i]);
         }
     }
-    shouldCheckBlockList = true;
+    // Only activate blocklist enforcement if there are rules to block.
+    // An empty blocklist ("nativeBlockList": []) blocks nothing and must NOT
+    // deactivate nativeAllowList or alter authorization.
+    if(!blockListVector.empty()) {
+        shouldCheckBlockList = true;
+    }
 }
 
 void __registerAllowList() {
+    allowedModules.clear();
+    allowedMethods.clear();
+    shouldCheckAllowList = false;
+
     json jNativeAllowList = settings::getOptionForCurrentMode("nativeAllowList");
     if(jNativeAllowList.is_null())
         return;
@@ -122,37 +135,56 @@ void __registerScopesLists() {
     shouldCheckScopesLists = true;
 }
 
+// Security fix for GHSA-7h48-j4q4-qwf3 (CWE-284 / CWE-863: Incorrect Authorization)
+//
+// Threat Model:
+// Neutralino supports two native API access lists: nativeAllowList and nativeBlockList.
+// Previously, if nativeBlockList was present in config (even as an empty array []),
+// the check returned true for any unblocked method without evaluating nativeAllowList.
+// This meant setting a blocklist inadvertently bypassed and disabled the allowlist,
+// exposing sensitive unlisted native APIs (filesystem, os, computer, storage) to JavaScript.
+//
+// Policy (Defense-in-Depth & Principle of Least Privilege):
+// 1. Blocklist check (negative constraint): If nativeBlockList is active, any method matching
+//    a blocked module or blocked method is immediately denied.
+// 2. Allowlist check (positive boundary): If nativeAllowList is active, only methods explicitly
+//    matching an allowed module or allowed method are permitted. Any unlisted method is denied.
+// 3. When both lists are defined, the intersection is enforced: the method must be allowed
+//    by nativeAllowList AND not blocked by nativeBlockList.
+// 4. Default: If neither list is configured, all methods are permitted by default.
 bool hasMethodAccess(const string &nativeMethod) {
     string module = __getModuleFromMethod(nativeMethod);
+
+    // 1. Check negative constraint (blocklist). If blocked, deny immediately.
     if(shouldCheckBlockList) {
-        // Check modules
         if(find(blockedModules.begin(), blockedModules.end(), module)
                 != blockedModules.end()) {
             return false;
         }
 
-        // Check methods
         if(find(blockedMethods.begin(), blockedMethods.end(), nativeMethod)
                 != blockedMethods.end()) {
             return false;
         }
-        return true; // method is not blocked
     }
-    else if(shouldCheckAllowList) {
-        // Check modules
+
+    // 2. Check positive constraint (allowlist). If an allowlist is configured,
+    // only listed methods/modules are allowed.
+    if(shouldCheckAllowList) {
         if(find(allowedModules.begin(), allowedModules.end(), module)
                 != allowedModules.end()) {
             return true;
         }
 
-        // Check methods
         if(find(allowedMethods.begin(), allowedMethods.end(), nativeMethod)
                 != allowedMethods.end()) {
             return true;
         }
-        return false; // method is not allowed
+        return false; // Method is not in allowlist -> denied
     }
-    return true; // anything is allowed if no allow/block list defined
+
+    // 3. If no allowlist is configured and the method was not blocked, permit access.
+    return true;
 }
 
 bool hasAPIAccess() {
