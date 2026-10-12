@@ -9,6 +9,7 @@
 #include "auth/permission.h"
 #include "helpers.h"
 #include "api/fs/fs.h"
+#include "api/debug/debug.h"
 
 using namespace std;
 using json = nlohmann::json;
@@ -39,16 +40,36 @@ string __getModuleFromMethod(const string &nativeMethod) {
 string __normalizeScopePath(const string &path) {
     string resolved = fs::applyPathConstants(path);
     string norm = resolved;
-    norm = FS_CONVWSTRN(filesystem::weakly_canonical(norm));
-    norm = FS_CONVWSTRN(filesystem::absolute(norm));
+    std::error_code ec;
+    auto canonicalPath = filesystem::weakly_canonical(norm, ec);
+    if(!ec) {
+        norm = FS_CONVWSTRN(canonicalPath);
+    }
+    auto absPath = filesystem::absolute(norm, ec);
+    if(!ec) {
+        norm = FS_CONVWSTRN(absPath);
+    }
     return helpers::normalizePath(norm);
 }
 
+// Security fix for GHSA-88px-53w7-3ppp (CWE-22: Filesystem Scopes Path Containment)
+//
+// Threat Model:
+// When filesystem scopes are enabled, paths accessed by JavaScript must be strictly
+// contained within designated allowed directory or file roots.
+// Path traversal via ".." or symlinks escaping the scope must be prevented.
+// Prefix checks must ensure directory boundary containment (e.g. "/app/data" must not match "/app/data_evil").
+// If root "/" is configured as a scope, all absolute paths starting with "/" must be permitted.
 bool __isPathInScope(const string &originalPath, const string &scope) {
     const string path = __normalizeScopePath(originalPath);
     if(path == scope) {
         return true;
     }
+    // If scope is root directory "/", any absolute path starting with "/" is in scope
+    if(scope == "/" && !path.empty() && path[0] == '/') {
+        return true;
+    }
+    // Directory boundary containment: path must start with scope followed by a directory separator
     if(path.size() > scope.size()
             && path.compare(0, scope.size(), scope) == 0
             && path[scope.size()] == '/') {
@@ -116,12 +137,57 @@ void __regiserCommandAllowList() {
     shouldCheckCommandAllowList = true;
 }
 
+// Security note for GHSA-88px-53w7-3ppp (CWE-22):
+//
+// Design & Backward Compatibility:
+// Neutralino allows unconstrained filesystem access if 'filesystemScopes' is omitted,
+// for backward compatibility with applications that legitimately access arbitrary user files.
+// However, omitting scopes means any JavaScript injection or token leak can read/write the host OS.
+//
+// Policy:
+// 1. Support primary flat "filesystemScopes" configuration option (official schema).
+// 2. Fall back to nested "filesystem.scopes" for backward compatibility with PR #1821.
+// 3. If scopes are omitted while filesystem APIs are enabled, emit a prominent SECURITY WARNING.
+// 4. (Architectural consideration for future major release: Default sandboxing to ${NL_PATH}
+//    or require explicit wildcard "*" for unrestricted host filesystem access).
 void __registerScopesLists() {
+    fileSystemReadScopes.clear();
+    fileSystemWriteScopes.clear();
+    shouldCheckScopesLists = false;
+
     json jScopes = settings::getOptionForCurrentMode("filesystemScopes");
-    if(jScopes.is_null())
+    if(jScopes.is_null()) {
+        // Fallback for backward compatibility with PR #1821 nested format
+        json jFs = settings::getOptionForCurrentMode("filesystem");
+        if(!jFs.is_null() && jFs.contains("scopes")) {
+            jScopes = jFs["scopes"];
+        }
+    }
+
+    if(jScopes.is_null() || !jScopes.is_object() || jScopes.empty()) {
+        // Check if filesystem module is accessible
+        bool fsAllowed = false;
+        if(find(allowedModules.begin(), allowedModules.end(), "filesystem") != allowedModules.end()) {
+            fsAllowed = true;
+        }
+        if(!shouldCheckAllowList) {
+            fsAllowed = true; // No allowlist means all methods are enabled
+        }
+        if(shouldCheckBlockList && find(blockedModules.begin(), blockedModules.end(), "filesystem") != blockedModules.end()) {
+            fsAllowed = false;
+        }
+
+        if(fsAllowed) {
+            debug::log(debug::LogTypeWarning,
+                "SECURITY WARNING: 'filesystemScopes' is not configured while filesystem APIs are enabled. "
+                "JavaScript can access any file or folder on the host system permitted by the current OS user. "
+                "To restrict disk access to specific folders, configure 'filesystemScopes' in neutralino.config.json.");
+        }
         return;
+    }
 
     for(const auto &entry: jScopes.items()) {
+        if(!entry.value().is_string()) continue;
         string perm = entry.value().get<string>();
         string normalizedScope = __normalizeScopePath(entry.key());
         if(perm == "read-write" || perm == "read") {
