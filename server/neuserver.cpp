@@ -5,6 +5,7 @@
 #include <chrono>
 #include <set>
 #include <fstream>
+#include <algorithm>
 
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
@@ -105,6 +106,122 @@ void __exitProcessIfIdle() {
         }
     });
     exitCheckThread.detach();
+}
+
+// Helper function to extract hostname from an Origin header or URL
+// per RFC 6454 (e.g., "http://localhost:8080" -> "localhost", "https://[::1]:3000" -> "::1")
+string __extractHostFromOrigin(const string &origin) {
+    if(origin.empty() || origin == "null") {
+        return "";
+    }
+    size_t schemePos = origin.find("://");
+    if(schemePos == string::npos) {
+        return "";
+    }
+    string authority = origin.substr(schemePos + 3);
+
+    // Strip trailing path, query, or fragment if present
+    size_t endPos = authority.find_first_of("/?#");
+    if(endPos != string::npos) {
+        authority = authority.substr(0, endPos);
+    }
+
+    string host;
+    if(!authority.empty() && authority.front() == '[') {
+        // IPv6 bracketed address literal, e.g. [::1]:8080
+        size_t closeBracket = authority.find(']');
+        if(closeBracket == string::npos) {
+            return "";
+        }
+        host = authority.substr(1, closeBracket - 1);
+    } else {
+        size_t colonPos = authority.find(':');
+        if(colonPos != string::npos) {
+            host = authority.substr(0, colonPos);
+        } else {
+            host = authority;
+        }
+    }
+
+    transform(host.begin(), host.end(), host.begin(), ::tolower);
+    return host;
+}
+
+// Security fix for GHSA-rjgv-ffxc-h5c2 (CWE-346: Origin Validation Error)
+//
+// Threat Model:
+// Cross-Site WebSocket Hijacking (CSWSH). In desktop modes (window, browser, chrome),
+// the WebSocket connection should only be initiated by the application frontend running
+// locally (or from a developer-configured external URL/dev server).
+// Browsers always send the destination host in the HTTP "Host" header, so checking "Host"
+// alone provides zero protection against malicious external websites (e.g. https://evil.example)
+// attempting to establish a WebSocket connection to ws://127.0.0.1:<port> if they obtain or
+// leak the connect token.
+// The browser's "Origin" header cannot be forged or overridden by client-side JavaScript.
+//
+// Policy:
+// 1. Cloud mode: Per CHANGELOG v5.0.0, any origin is permitted in cloud mode.
+// 2. Empty Origin: Non-browser clients (native extensions, internal helper processes,
+//    CLI tools) do not send an Origin header and are allowed per RFC 6455 §4.2.1.
+// 3. "null" Origin: Untrusted opaque origin (sandboxed iframe / data: URI) is rejected.
+// 4. Desktop modes: The origin host must match:
+//    - Loopback addresses: "localhost", "127.0.0.1", or "::1".
+//    - The configured serverHost (if explicitly bound via --host / config).
+//    - If serverHost is "0.0.0.0", the requesting IP address matching reqHost.
+//    - The host of any configured "url" option (e.g., remote URL or dev server).
+bool __isOriginAllowed(const string &origin, const string &reqHost) {
+    // 1. Cloud mode allows any origin
+    if(settings::getMode() == settings::AppModeCloud) {
+        return true;
+    }
+
+    // 2. Non-browser clients (extensions, background daemons, curl) do not set Origin
+    if(origin.empty()) {
+        return true;
+    }
+
+    // 3. Reject opaque "null" origins
+    if(origin == "null") {
+        return false;
+    }
+
+    // 4. Extract host from origin
+    string originHost = __extractHostFromOrigin(origin);
+    if(originHost.empty()) {
+        return false;
+    }
+
+    // 5. Allow standard loopback origins
+    if(originHost == "localhost" || originHost == "127.0.0.1" || originHost == "::1") {
+        return true;
+    }
+
+    // 6. Allow explicitly configured serverHost (e.g. --host=192.168.1.100)
+    if(!serverHost.empty() && serverHost != "0.0.0.0" && originHost == serverHost) {
+        return true;
+    }
+
+    // 7. If serverHost is 0.0.0.0 (all interfaces), allow if originHost matches request host
+    //    and is a valid IP address (preventing DNS rebinding)
+    if(serverHost == "0.0.0.0" && originHost == reqHost) {
+        websocketpp::lib::asio::error_code ec;
+        websocketpp::lib::asio::ip::address::from_string(originHost, ec);
+        if(!ec) {
+            return true;
+        }
+    }
+
+    // 8. Allow if origin matches configured "url" option (e.g. Vite dev server, remote web app)
+    json jUrl = settings::getOptionForCurrentMode("url");
+    if(!jUrl.is_null()) {
+        string configUrl = jUrl.get<string>();
+        string configHost = __extractHostFromOrigin(configUrl);
+        if(!configHost.empty() && originHost == configHost) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 string init() {
@@ -328,6 +445,14 @@ bool handleValidate(websocketpp::connection_hdl handler) {
     string host = con->get_host();
 
     if(!(host == "localhost" || host == "127.0.0.1" || host == serverHost || serverHost == "0.0.0.0") && settings::getMode() != settings::AppModeCloud) {
+        return false;
+    }
+
+    // Security fix for GHSA-rjgv-ffxc-h5c2 (CWE-346: Origin Validation Error)
+    // Enforce Origin validation during WebSocket handshake to prevent Cross-Site WebSocket Hijacking (CSWSH)
+    string origin = con->get_request_header("Origin");
+    if(!__isOriginAllowed(origin, host)) {
+        con->set_status(websocketpp::http::status_code::forbidden);
         return false;
     }
 
