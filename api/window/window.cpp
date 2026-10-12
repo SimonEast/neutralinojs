@@ -607,6 +607,74 @@ window::SizeOptions __jsonToSizeOptions(const json &input, bool useDefaultRect =
     return sizeOptions;
 }
 
+// GHSA-cmmf-x4cv-8882 / CWE-284: Origin checking helpers for window injection
+bool __isRemoteUrl(const string &url) {
+    if(url.empty() || url[0] == '/' || url.rfind("file:", 0) == 0) {
+        return false;
+    }
+    size_t schemePos = url.find("://");
+    if(schemePos == string::npos) {
+        return false;
+    }
+    size_t hostStart = schemePos + 3;
+    size_t hostEnd = url.find_first_of(":/ ?#", hostStart);
+    string host = (hostEnd == string::npos) ? url.substr(hostStart) : url.substr(hostStart, hostEnd - hostStart);
+    if(host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]") {
+        return false;
+    }
+    return true;
+}
+
+string __getOriginFromUrl(const string &url) {
+    size_t schemePos = url.find("://");
+    if(schemePos == string::npos) return "";
+    size_t hostStart = schemePos + 3;
+    size_t pathStart = url.find_first_of("/?#", hostStart);
+    return (pathStart == string::npos) ? url : url.substr(0, pathStart);
+}
+
+vector<string> __getAllowedOrigins() {
+    vector<string> allowed;
+    if(__isRemoteUrl(windowProps.url)) {
+        string origin = __getOriginFromUrl(windowProps.url);
+        if(!origin.empty()) allowed.push_back(origin);
+        size_t schemePos = windowProps.url.find("://");
+        if(schemePos != string::npos) {
+            size_t hostStart = schemePos + 3;
+            size_t hostEnd = windowProps.url.find_first_of(":/ ?#", hostStart);
+            string host = (hostEnd == string::npos) ? windowProps.url.substr(hostStart) : windowProps.url.substr(hostStart, hostEnd - hostStart);
+            if(!host.empty() && host != origin) allowed.push_back(host);
+        }
+    }
+    json jAllowed = settings::getOptionForCurrentMode("allowedOrigins");
+    if(jAllowed.is_array()) {
+        for(const auto &item : jAllowed) {
+            if(item.is_string()) {
+                allowed.push_back(item.get<string>());
+            }
+        }
+    }
+    return allowed;
+}
+
+string __wrapWithOriginCheck(const string &jsCode, const vector<string> &allowedOrigins) {
+    json originsJson = allowedOrigins;
+    string wrapper = "if((function(){\n"
+                     "  try {\n"
+                     "    var allowed = " + originsJson.dump() + ";\n"
+                     "    var curOrigin = window.location.origin;\n"
+                     "    var curHost = window.location.hostname;\n"
+                     "    if(curHost === 'localhost' || curHost === '127.0.0.1' || curHost === '::1' || window.location.protocol === 'file:') return true;\n"
+                     "    for(var i = 0; i < allowed.length; i++) {\n"
+                     "      if(allowed[i] && (curOrigin === allowed[i] || curHost === allowed[i])) return true;\n"
+                     "    }\n"
+                     "    console.warn('Neutralinojs: Native token injection blocked on untrusted origin: ' + curOrigin);\n"
+                     "    return false;\n"
+                     "  } catch(e) { return false; }\n"
+                     "})()) {\n" + jsCode + "\n}";
+    return wrapper;
+}
+
 void __injectClientLibrary() {
     json options = settings::getConfig();
     json jClientLibrary = options["cli"]["clientLibrary"];
@@ -614,8 +682,9 @@ void __injectClientLibrary() {
         string clientLibPath = jClientLibrary.get<string>();
         fs::FileReaderResult fileReaderResult = resources::getFile(clientLibPath);
         if(fileReaderResult.status == errors::NE_ST_OK) {
-            nativeWindow->init(settings::getGlobalVars() + "var NL_CINJECTED = true;" + 
-                fileReaderResult.data);
+            string script = settings::getGlobalVars() + "var NL_CINJECTED = true;" + 
+                fileReaderResult.data;
+            nativeWindow->init(__wrapWithOriginCheck(script, __getAllowedOrigins()));
         }
     }
 }
@@ -671,8 +740,16 @@ bool __createWindow() {
         events::dispatch("filesDropped", droppedPaths);
     });
 
-    if(windowProps.injectGlobals) 
-        nativeWindow->init(settings::getGlobalVars() + "var NL_GINJECTED = true;");
+    if((windowProps.injectGlobals || windowProps.injectClientLibrary) && __isRemoteUrl(windowProps.url)) {
+        debug::log(debug::LogTypeWarning,
+            "SECURITY WARNING: 'injectClientLibrary' or 'injectGlobals' is enabled with an external URL (" +
+            windowProps.url + "). This grants full native API access and credentials to external websites.");
+    }
+
+    if(windowProps.injectGlobals) {
+        string script = settings::getGlobalVars() + "var NL_GINJECTED = true;";
+        nativeWindow->init(__wrapWithOriginCheck(script, __getAllowedOrigins()));
+    }
 
     if(windowProps.injectClientLibrary)
         __injectClientLibrary();

@@ -230,6 +230,25 @@
             "webviewArgs": {
                 "type": "string",
                 "description": "Additional command-line arguments for the WebView2 process."
+            },
+            "injectGlobals": {
+              "type": "boolean",
+              "description": "Injects NL_* global variables into the window. Caution: enabling this with an external URL exposes credentials (NL_TOKEN) to remote web pages."
+            },
+            "injectClientLibrary": {
+              "type": "boolean",
+              "description": "Injects the Neutralino client library into the window. Caution: enabling this with an external URL exposes native APIs to remote web pages."
+            },
+            "injectScript": {
+              "type": "string",
+              "description": "Path to a JavaScript file to inject into the window before running the primary webapp scripts."
+            },
+            "allowedOrigins": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "List of allowed origins/domains permitted to receive injected Neutralino credentials and client library."
             }
           }
         },
