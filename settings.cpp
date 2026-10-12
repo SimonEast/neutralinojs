@@ -136,15 +136,17 @@ string getNavigationUrl() {
         settings::getOptionForCurrentMode("url").get<string>() : "https://neutralino.js.org";
 }
 
-// GHSA-4crw-f874-crr2 / CWE-79: Safely serialize JSON values into JavaScript source code.
-// Escapes HTML/script tags and line separators so the literal is safe in all JS/HTML contexts.
+// GHSA-4crw-f874-crr2 / CWE-79: Safely serialize JSON values for JavaScript JSON.parse(...)
+// Uses double-serialization so the JSON payload is encoded as a double-quoted JS string literal,
+// ensuring values are strictly parsed via JSON.parse() at runtime without executing functions.
 string __escapeJsonForJs(const json &val) {
-    string dumped = val.dump();
+    string jsonPayload = val.dump();
+    string jsStringLiteral = json(jsonPayload).dump();
     // Escape "</script" to prevent breaking out of HTML <script> tags
-    dumped = regex_replace(dumped, regex("</script", regex_constants::icase), "<\\/script");
+    jsStringLiteral = regex_replace(jsStringLiteral, regex("</script", regex_constants::icase), "<\\/script");
     // Escape "<!--" to avoid HTML comment parsing anomalies
-    dumped = regex_replace(dumped, regex("<!--"), "<\\!--");
-    return dumped;
+    jsStringLiteral = regex_replace(jsStringLiteral, regex("<!--"), "<\\!--");
+    return jsStringLiteral;
 }
 
 string getGlobalVars(){
@@ -182,7 +184,7 @@ string getGlobalVars(){
                     "'. Keys must contain only alphanumeric characters and underscores.");
                 continue;
             }
-            jsSnippet += "var NL_" + key + "=" + __escapeJsonForJs(it.value()) + ";";
+            jsSnippet += "var NL_" + key + "=JSON.parse(" + __escapeJsonForJs(it.value()) + ");";
         }
     }
     return jsSnippet;

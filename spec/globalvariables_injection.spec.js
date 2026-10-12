@@ -77,6 +77,7 @@ describe('globalVariables script injection / XSS security (CWE-79 / GHSA-4crw-f8
             const authInfo = await waitForAuthInfo();
             const res = await fetchHttp(authInfo.nlPort, '/__neutralino_globals.js');
             assert.strictEqual(res.statusCode, 200);
+            assert.ok(res.body.includes('var NL_SAFE_VAR=JSON.parse('), 'Must explicitly use JSON.parse() for variable definitions');
 
             // Execute the generated script in an isolated sandbox context
             const sandbox = {};
