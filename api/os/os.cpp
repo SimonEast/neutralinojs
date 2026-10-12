@@ -28,11 +28,13 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 extern char **environ;
 #endif
 
 #if defined(__APPLE__)
 #include <objc/objc-runtime.h>
+#include <dispatch/dispatch.h>
 #endif
 
 #if defined(_WIN32)
@@ -138,15 +140,44 @@ void cleanupTray() {
     #endif
 }
 
+// GHSA-7678-3cfx-jfc5 / CWE-78: Avoid shell interpolation by invoking native OS APIs or direct argv execution
 void open(const string &url) {
     #if defined(__linux__) || defined(__FreeBSD__)
-    os::ChildProcessOptions processOptions;
-    processOptions.background = true;
-    os::execCommand("xdg-open \"" + url + "\"", processOptions);
+    // Direct argv execution via execvp without /bin/sh to prevent command injection
+    pid_t pid = fork();
+    if(pid == 0) {
+        pid_t grandChild = fork();
+        if(grandChild == 0) {
+            char *argv[] = {
+                const_cast<char *>("xdg-open"),
+                const_cast<char *>(url.c_str()),
+                nullptr
+            };
+            execvp("xdg-open", argv);
+            _exit(1);
+        }
+        _exit(0);
+    }
+    if(pid > 0) {
+        waitpid(pid, nullptr, 0);
+    }
     #elif defined(__APPLE__)
-    os::ChildProcessOptions processOptions;
-    processOptions.background = true;
-    os::execCommand("open \"" + url + "\"", processOptions);
+    // Use Cocoa NSWorkspace on macOS main queue to launch URLs/files safely without shell
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id workspace = ((id (*)(id, SEL))objc_msgSend)("NSWorkspace"_cls, "sharedWorkspace"_sel);
+        id nsUrlStr = ((id (*)(id, SEL, const char *))objc_msgSend)("NSString"_cls, "stringWithUTF8String:"_sel, url.c_str());
+        if(nsUrlStr != nullptr) {
+            id nsUrl = nullptr;
+            if(url.find("://") != string::npos) {
+                nsUrl = ((id (*)(id, SEL, id))objc_msgSend)("NSURL"_cls, "URLWithString:"_sel, nsUrlStr);
+            } else {
+                nsUrl = ((id (*)(id, SEL, id))objc_msgSend)("NSURL"_cls, "fileURLWithPath:"_sel, nsUrlStr);
+            }
+            if(nsUrl != nullptr) {
+                ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, "openURL:"_sel, nsUrl);
+            }
+        }
+    });
     #elif defined(_WIN32)
     ShellExecute(0, 0, helpers::str2wstr(url).c_str(), 0, 0, SW_SHOW );
     #endif
