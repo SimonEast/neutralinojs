@@ -139,7 +139,7 @@ string getNavigationUrl() {
 // GHSA-4crw-f874-crr2 / CWE-79: Safely serialize JSON values for JavaScript JSON.parse(...)
 // Uses double-serialization so the JSON payload is encoded as a double-quoted JS string literal,
 // ensuring values are strictly parsed via JSON.parse() at runtime without executing functions.
-string __escapeJsonForJs(const json &val) {
+string escapeJsonForJs(const json &val) {
     string jsonPayload = val.dump();
     string jsStringLiteral = json(jsonPayload).dump();
     // Escape "</script" to prevent breaking out of HTML <script> tags
@@ -184,7 +184,7 @@ string getGlobalVars(){
                     "'. Keys must contain only alphanumeric characters and underscores.");
                 continue;
             }
-            jsSnippet += "var NL_" + key + "=JSON.parse(" + __escapeJsonForJs(it.value()) + ");";
+            jsSnippet += "var NL_" + key + "=JSON.parse(" + escapeJsonForJs(it.value()) + ");";
         }
     }
     return jsSnippet;
